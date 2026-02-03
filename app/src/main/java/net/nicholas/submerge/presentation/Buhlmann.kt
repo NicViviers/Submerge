@@ -2,6 +2,9 @@ package net.nicholas.submerge.presentation
 
 import android.util.Log
 import androidx.compose.runtime.MutableState
+import kotlin.math.ceil
+import kotlin.math.ln
+import kotlin.math.min
 import kotlin.math.pow
 
 class Buhlmann(
@@ -9,7 +12,8 @@ class Buhlmann(
     val depth_m: MutableState<Double>, // Depth in meters
     val time: MutableState<Int>, // Time in minutes
     val fO2: MutableState<Double>, // Fraction of oxygen TODO: Implement gas switching - shouldn't be too hard?
-    val pFactor: Int, // Safety factor 0 - 2 TODO: Need to properly implement this
+    val pFactor: MutableState<Int>, // TODO: Need to properly implement this for deco schedule,
+                                    // maybe just assume a faster on-gassing rate or add additional nitrogen to tissue loading calculations?
 
     // Panel information
     val n2: MutableState<Double>,
@@ -30,8 +34,9 @@ class Buhlmann(
     private val descentStepTime = 0.1 // Refresh tissues every 6 seconds
 
     // Initiate tissue loading for atmospheric pressure
-    // TODO: Jakob, does this actually need to happen?
     private var tissues = (0..15).map { compLoading(fN2, fN2, 100.0, hN2[it]) }
+    private var tissuesCopy = tissues // Copy for repeating no-deco simulations
+    private var noFlyTissues = tissues // Copy for no-fly calculations
 
     private fun calculateCeilings(): List<Pair<Int, Double>> {
         return tissues.mapIndexed { i, it ->
@@ -44,8 +49,6 @@ class Buhlmann(
         return listOf(3, 6, 9, 12).filter { it >= depth }.minOrNull() ?: 12
     }
 
-    // TODO: Something isn't right here
-    // 1 minute stop at 3m for a 53 meter dive for 10 minutes can't be right
     private fun calculateDecompression(): List<Int> {
         val stops = mutableListOf(safetyStopDuration, 0, 0, 0) // 3m, 6m, 9m, 12m
         var lastStop = depth_m.value // Start ascent simulation from bottom depth
@@ -90,21 +93,14 @@ class Buhlmann(
             decoms = ceilings.filter { it.second > 1.0 }
         }
 
+        // Store tissue state for no-fly calculations after deco
+        // TODO: Doesn't work?
+        noFlyTissues = tissues
+
         return stops
     }
 
-    // Refreshes the data on the UI
-    private fun refresh(
-        decoT: Int,
-        noDecoT: Int,
-        noFlyT: Int
-    ) {
-        deco.value = decoT
-        noDeco.value = noDecoT
-        noFly.value = noFlyT
-    }
-
-    fun simulateDescent() {
+    private fun simulateDescent() {
         val stepDistance = descentRate * descentStepTime // Distance traveled per step
         var currentDepth = 0.0 // Starting depth
         val totalDescent = depth_m.value // Depth to descend to
@@ -119,18 +115,54 @@ class Buhlmann(
             }
         }
 
+        // Load tissues for bottom time
         tissues = tissues.mapIndexed { i, it ->
             compLoading(it * fN2, depth * fN2, time.value.toDouble(), hN2[i])
         }
     }
 
-    fun loadToBottom() {
+    // TODO: Something is messing with the tissue compartments when this gets called by the UI
+    // It initially shows fine, but after switching to the others even back to the original then it nearly triples
+    // Possibly the Deco / No Deco?
+    fun calculateNoFly() {
+        var maxTime = 0.0
+        var slowestCompartmentIndex = -1
+
+        for (i in noFlyTissues.indices) {
+            val P0 = noFlyTissues[i]
+            val T_half = hN2[i]
+
+            if (P0 > 0.75) {
+                val timeToFly = -T_half * ln(0.75 / P0)
+
+                if (timeToFly > maxTime) {
+                    maxTime = timeToFly
+                    slowestCompartmentIndex = i
+                }
+            }
+        }
+
+        // Add safety margin to time (1 = 10%, 2 = 20%)
+        Log.d("Submerge", "P0: ${(maxTime * (1 + 0 / 10)).toInt()}\n" +
+                "P1: ${(maxTime * (1 + 1 / 10)).toInt()}\n" +
+                "P2: ${(maxTime * (1 + 2 / 10)).toInt()}")
+        Log.d("Submerge", "P0: ${ceil(maxTime * (1 + 0 / 10)).toInt()}\n" +
+                "P1: ${ceil(maxTime * (1 + 1 / 10)).toInt()}\n" +
+                "P2: ${ceil(maxTime * (1 + 2 / 10)).toInt()}")
+//        val noFlyT = if (slowestCompartmentIndex != 0) ceil(maxTime * (1 + pFactor.value / 10)).toInt() else 0
+        val noFlyT = if (slowestCompartmentIndex != 0) maxTime.toInt() else 0
+        noFly.value = if (noFlyT > 99) 99 else noFlyT // Update no-fly state
+    }
+
+    fun calculateAll() {
         simulateDescent()
-        val decoTime = calculateDecompression()
-        val decoT = decoTime.sum()
+        tissuesCopy = tissues
+        calculateNoFly()
+        val decoT = calculateDecompression().sum()
 
-        Log.d("Submerge", "$decoTime: $decoT")
+        tissues = tissuesCopy // Prepare tissues for NDL simulations at depth after descent again
 
+        // TODO: Rewrite this using HTs and ceilings instead of running tons of simulations until we get it
         // Run calculations for no deco limits
         val noDecoT = if (decoT == safetyStopDuration) {
             val surfaceTissues = (0..15).map { compLoading(fN2, fN2, 100.0, hN2[it]) }
@@ -152,7 +184,9 @@ class Buhlmann(
             noDecoT
         } else { 0 }
 
-        refresh(decoT - safetyStopDuration, noDecoT, 0) // TODO: Implement no-fly logic
+        // Update Deco and No Deco states
+        deco.value = if (decoT - safetyStopDuration > 99) 99 else decoT - safetyStopDuration
+        noDeco.value = if (noDecoT > 99) 99 else noDecoT
     }
 
     companion object {
@@ -202,33 +236,13 @@ class Buhlmann(
              * @return The ceiling pressure of a tissue compartment before bubble formation occurs
              *           if below 1 bar, then we can ascend to surface without bubbles
              */
-            return (Pcomp - a) * b
-        }
+            var ceiling = (Pcomp - a) * b
 
-        // This tells us what tissue compartment is the most loaded, and to what depth (bar) it can ascend to without bubble formation
-        fun ceiling(Pbegin: Double, depth: Int, te: Double): Double {
-            /**
-             *  @param Pbegin: Inert gas pressure in compartment before exposure
-             *  @param depth: Depth in bar
-             *  @param te: Exposure time in minutes
-             *  @return The shallowest depth possible to ascend to without bubble formation
-             */
-            return (0..15).maxOf { compCeiling(compLoading(Pbegin, depth * Pbegin, te, hN2[it]), aN2[it], bN2[it]) }
-        }
+            if (ceiling < 0) {
+                ceiling = 1.0
+            }
 
+            return ceiling
+        }
     }
 }
-
-//fun main() {
-//      // Dive parameters
-//    val fN2 = 0.79
-//    val depth = 4 // bar
-//    val time = 10.0 // minutes
-//    val compartment = 5
-//
-//    val loading = compLoading(fN2, depth * fN2, time, hN2[compartment - 1])
-//    println(loading)
-//    println(compCeiling(loading, aN2[compartment - 1], bN2[compartment - 1]))
-//
-//    println(ceiling(0.79, 4, 10.0))
-//}
